@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import catboost
-from utils import read_file, create_features, create_illness_features
+from utils import read_file, create_features, create_illness_features, create_features_for_shap
 from sklearn.inspection import permutation_importance
 from sklearn.metrics import classification_report, confusion_matrix
 from golden_features import cols_le
@@ -31,9 +31,9 @@ def get_shap_df(cur_df):
 
 
 @st.cache_resource(show_spinner=True)
-def get_shap_values(cur_df):
+def get_shap_values(cur_df, feature_names):
     explainer = shap.TreeExplainer(model)
-    test_pool = Pool(cur_df.drop(target_col, axis=1).fillna(0), cur_df[target_col])
+    test_pool = Pool(cur_df[feature_names].fillna(0), cur_df[target_col])
     shap_values = explainer.shap_values(test_pool)
     print(shap_values)
     return shap_values, explainer
@@ -43,7 +43,7 @@ def get_shap_values(cur_df):
 def get_preds(df):
     max_id = df[df['target_1'].notna()].index.max()
     # print(df.iloc[max_id])
-    preds = [df.iloc[max_id][target_col] * cb_model.predict(df[all_models[0].feature_names_].iloc[max_id+1]) for cb_model in all_models]
+    preds = [df.iloc[max_id][target_col] * cb_model.predict(df[cb_model.feature_names_].iloc[max_id+1]) for cb_model in all_models]
     sample_submission = pd.DataFrame({
     'week': ['04.09.2023', '11.09.2023', '18.09.2023', '25.09.2023', '02.10.2023', '09.10.2023', '16.10.2023', '23.10.2023', '30.10.2023', '06.11.2023', '13.11.2023', '20.11.2023', '27.11.2023', '04.12.2023', '11.12.2023', '18.12.2023', '25.12.2023', '01.01.2024', '08.01.2024', '15.01.2024', '22.01.2024', '29.01.2024', '05.02.2024', '12.02.2024', '19.02.2024', '26.02.2024', '04.03.2024', '11.03.2024', '18.03.2024'],
     'revenue': preds
@@ -119,6 +119,7 @@ with st.expander("Загрузка файла"):
     file = st.file_uploader(label='Загрузите файл с данными для анализа', accept_multiple_files=False, type=['xlsx'])
     if file is not None:
         uploaded_df = read_file(file)
+        extra_df = uploaded_df.copy(deep=True)
         st.session_state.clicked1 = st.button('Получить предсказания и анализ ', type='primary', use_container_width=True)
 
 
@@ -224,10 +225,13 @@ if st.session_state.clicked1 or st.session_state.clicked2 or st.session_state.cl
         st.download_button('Скачать таблицу с предсказаниями', data=preds.to_csv(index=False).encode("utf-8"), type='secondary', use_container_width=True, file_name='predicted_sales.csv')
 
 
-        df = prediction_df.copy()[used_columns]
-        shap_df = get_shap_df(df)
+        model = CatBoostRegressor()
+        model.load_model('info_model.cbm')
 
-        shap_values, explainer = get_shap_values(df)
+        df = create_features_for_shap(uploaded_df).reset_index(drop=True)
+        df = df[df['продажи'].notna()].dropna()
+        shap_df = get_shap_df(df)
+        shap_values, explainer = get_shap_values(df, model.feature_names_)
         feature_names = df.drop(target_col, axis=1).columns
         # feature_names = [cols_le[x] for x in feature_names]
 
@@ -292,7 +296,7 @@ if st.session_state.clicked1 or st.session_state.clicked2 or st.session_state.cl
         with col2:
             st.markdown("""###### График показывает влияние на предсказание в разрезе каждого признака и его значений. \n* **Ось X**: Значения признака. \n* **Ось Y**: Важность данного признака для предсказаний модели. Чем выше значение на оси Y, тем более важным является данный признак для модели.""")
 
-            column_to_plot = st.selectbox('Выберите колонку для построения графика:', used_columns)
+            column_to_plot = st.selectbox('Выберите колонку для построения графика:', model.feature_names_)
             st_shap(shap.dependence_plot(column_to_plot, shap_values, shap_df.drop(target_col, axis=1), feature_names=feature_names), height=400)
 
         st.divider()
@@ -337,15 +341,6 @@ if st.session_state.clicked1 or st.session_state.clicked2 or st.session_state.cl
 
         st.divider()
 
-        # col1, col2, col3, col4 = st.columns(4)
-
-        # col1.metric('Количество уникальных поставщиков', df['Поставщик'].nunique())
-        # col2.metric('Средняя длительность поставки', round(df['Длительность'].mean(), 2))
-        # col3.metric('Количество своевременных поставок', df[df[target_col] == 0].shape[0])
-        # col4.metric('Количество просрочек', df[df[target_col] == 1].shape[0])
-
-        # st.divider()
-
         st.markdown('##### Анализ предсказания модели')
 
         col1, col2 = st.columns(2)
@@ -366,7 +361,7 @@ if st.session_state.clicked1 or st.session_state.clicked2 or st.session_state.cl
 
         with col2:
             illness_models = pickle.load(open('models_bolezn.pkl', 'rb'))
-            ilness_df = create_illness_features(uploaded_df).reset_index(drop=True)
+            ilness_df = create_illness_features(extra_df).reset_index(drop=True)
             max_id = ilness_df[ilness_df['target_1'].notna()].index.max()
             new_preds = [ilness_df.iloc[max_id]['заболеваемость'] * model.predict(ilness_df[illness_models[0].feature_names_].iloc[max_id+1]) for model in illness_models]
             plt.figure(figsize=(8, 5))
@@ -379,11 +374,13 @@ if st.session_state.clicked1 or st.session_state.clicked2 or st.session_state.cl
             y_plot = prev + new_preds
             plt.plot(list(range(len(prev))), prev, color='blue', label='Предыдущие заболевания')
             plt.plot(list(range(len(prev), x_plot)), new_preds, color='red', label='Предсказанные заболевания')
+            plt.scatter([36, 88, 140, 192], [prev[x] for x in [36, 88, 140, 192]], color='red', marker='o', label='Идеальные моменты для покупки рекламы')
             plt.xlabel('Дни')
             plt.ylabel('К-во больных')
             plt.title('Прогнозирование к-во больных')
             plt.legend()
             st.pyplot(plt)
+
 
         st.divider()
 
